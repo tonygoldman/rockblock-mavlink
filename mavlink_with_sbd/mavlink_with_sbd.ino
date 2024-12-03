@@ -171,11 +171,12 @@ void setupModem(void) {
 }
 
 // TODO: not sure if needed - allow other threads run time during blocking calls
-bool ISBDCallback(void) {
-  rtos::ThisThread::sleep_for(20);
+// iridiumSBD calls this callback repeatedly during long blocking operations
+// bool ISBDCallback(void) {
+  // rtos::ThisThread::yield();
   // Serial.println("sleeping");`
-  return true;
-}
+  // return true;
+// }
 
 // TODO: verify ack
 void sendRTL() {
@@ -197,10 +198,8 @@ void sendRTL() {
 
   // Pack the message
   mavlink_msg_command_long_pack(1, 44, &msg, target_system, target_component, command, confirmation, param1, param2, param3, param4, param5, param6, param7);
-
-  // Copy the message to the send buffer
   uint16_t len = mavlink_msg_to_send_buffer(buf, &msg);
-  // Send the message (.write sends as bytes)
+
   mavlinkSerialMutex.lock();
   mavlinkSerial.write(buf, len);
   mavlinkSerialMutex.unlock();
