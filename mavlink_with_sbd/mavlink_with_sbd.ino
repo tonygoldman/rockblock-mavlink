@@ -1,3 +1,9 @@
+#include <SoftwareSerial.h>
+#include <MAVLink_ardupilotmega.h>
+#include <rtos.h>
+#include <IridiumSBD.h>
+
+// consts from the artemis sbd example
 #define busVoltagePin 13     // Bus voltage divided by 3 (Analog in)
 #define iridiumSleep 17      // Iridium 9603N ON/OFF (sleep) pin: pull high to enable the 9603N
 #define iridiumNA 18         // Input for the Iridium 9603N Network Available
@@ -9,23 +15,17 @@
 #define superCapPGOOD 28     // Input for the LTC3225 super capacitor charger PGOOD signal
 #define busVoltageMonEN 34   // Bus voltage monitor enable: pull high to enable bus voltage monitoring (via Q4 and Q3)
 #define iridiumRI 41         // Input for the Iridium 9603N Ring Indicator
-
+// project consts
 #define sbdMessageSize 150
 #define secondToMillisecond 1e3
 #define infoTransmissionIntervalMillis 90 * secondToMillisecond
 
-
-#include <SoftwareSerial.h>
-#include <MAVLink_ardupilotmega.h>
-#include <rtos.h>
-#include <IridiumSBD.h>
-
 SoftwareSerial mavlinkSerial(D11, D15);  // D11 id the blue which is TX from the pixhawk, D15 is the purple which is RX from the pixhawk
-IridiumSBD modem(Serial1, iridiumSleep, iridiumRI);
+IridiumSBD sbdModem(Serial1, iridiumSleep, iridiumRI);
 rtos::Thread mavlinkRxThread;
-rtos::Thread modemThread;
+rtos::Thread mavlinkTxThread;
+// TODO: use eventflags to publish message
 rtos::Queue<char, 3> modemSendQueue;
-// TODO: use EventFlags to reduce sleep and optimize speed
 rtos::Mutex mavlinkSerialMutex;
 
 void gnssOFF(void)  // Disable power for the GNSS
@@ -36,6 +36,35 @@ void gnssOFF(void)  // Disable power for the GNSS
   delay(1);
 
   digitalWrite(gnssEN, HIGH);  // Disable GNSS power (HIGH = disable; LOW = enable)
+}
+
+// TODO: is it really necessary
+// Overwrite the IridiumSBD beginSerialPort function - a fix for https://github.com/sparkfun/Arduino_Apollo3/issues/423
+void IridiumSBD::beginSerialPort(void)  // Start the serial port connected to the satellite modem
+{
+  diagprint(F("custom IridiumSBD::beginSerialPort\r\n"));
+
+  // Configure the standard ATP pins for UART1 TX and RX - endSerialPort may have disabled the RX pin
+
+  am_hal_gpio_pincfg_t pinConfigTx = g_AM_BSP_GPIO_COM_UART_TX;
+  pinConfigTx.uFuncSel = AM_HAL_PIN_24_UART1TX;
+  pin_config(D24, pinConfigTx);
+
+  am_hal_gpio_pincfg_t pinConfigRx = g_AM_BSP_GPIO_COM_UART_RX;
+  pinConfigRx.uFuncSel = AM_HAL_PIN_25_UART1RX;
+  pinConfigRx.ePullup = AM_HAL_GPIO_PIN_PULLUP_WEAK;  // Put a weak pull-up on the Rx pin
+  pin_config(D25, pinConfigRx);
+
+  Serial1.begin(19200);
+}
+
+// TODO: is it really necessary
+// Overwrite the IridiumSBD endSerialPort function - a fix for https://github.com/sparkfun/Arduino_Apollo3/issues/423
+void IridiumSBD::endSerialPort(void) {
+  diagprint(F("custom IridiumSBD::endSerialPort\r\n"));
+
+  // Disable the Serial1 RX pin to avoid the code hang
+  am_hal_gpio_pinconfig(PinName(D25), g_AM_HAL_GPIO_DISABLE);
 }
 
 void setupModemPins(void) {
@@ -69,61 +98,11 @@ void setupModemSuperCap(void) {
   Serial.println(F("Supercapacitors charged!"));
 }
 
-// TODO: is it really necessary
-// Overwrite the IridiumSBD beginSerialPort function - a fix for https://github.com/sparkfun/Arduino_Apollo3/issues/423
-void IridiumSBD::beginSerialPort()  // Start the serial port connected to the satellite modem
-{
-  diagprint(F("custom IridiumSBD::beginSerialPort\r\n"));
-
-  // Configure the standard ATP pins for UART1 TX and RX - endSerialPort may have disabled the RX pin
-
-  am_hal_gpio_pincfg_t pinConfigTx = g_AM_BSP_GPIO_COM_UART_TX;
-  pinConfigTx.uFuncSel = AM_HAL_PIN_24_UART1TX;
-  pin_config(D24, pinConfigTx);
-
-  am_hal_gpio_pincfg_t pinConfigRx = g_AM_BSP_GPIO_COM_UART_RX;
-  pinConfigRx.uFuncSel = AM_HAL_PIN_25_UART1RX;
-  pinConfigRx.ePullup = AM_HAL_GPIO_PIN_PULLUP_WEAK;  // Put a weak pull-up on the Rx pin
-  pin_config(D25, pinConfigRx);
-
-  Serial1.begin(19200);
-}
-
-// TODO: is it really necessary
-// Overwrite the IridiumSBD endSerialPort function - a fix for https://github.com/sparkfun/Arduino_Apollo3/issues/423
-void IridiumSBD::endSerialPort() {
-  diagprint(F("custom IridiumSBD::endSerialPort\r\n"));
-
-  // Disable the Serial1 RX pin to avoid the code hang
-  am_hal_gpio_pinconfig(PinName(D25), g_AM_HAL_GPIO_DISABLE);
-}
-
-void setupModem(void) {
-  int signalQuality = -1;
-  int err;
-
-  setupModemPins();
-
-  // TODO: is it really necessary
-  // Make sure the Serial1 RX pin is disabled to prevent the power-on glitch on the modem's RX(OUT) pin
-  // causing problems with v2.1.0 of the Apollo3 core. Requires v3.0.5 of IridiumSBDi2c.
-  modem.endSerialPort();
-
-  setupModemSuperCap();
-
-  // Enable power for the 9603N
-  Serial.println(F("Enabling 9603N power..."));
-  digitalWrite(iridiumPwrEN, HIGH);  // Enable Iridium Power
-  delay(1000);
-
-  // If we're powering the device by USB, tell the library to
-  // relax timing constraints waiting for the supercap to recharge.
-  modem.setPowerProfile(IridiumSBD::USB_POWER_PROFILE);
-
+void startModem(void) {
   // Begin satellite modem operation
   // Also begin the serial port connected to the satellite modem via IridiumSBD::beginSerialPort
   Serial.println(F("Starting modem..."));
-  err = modem.begin();
+  int err = sbdModem.begin();
   if (err != ISBD_SUCCESS) {
     Serial.print(F("Begin failed: error "));
     Serial.println(err);
@@ -131,11 +110,14 @@ void setupModem(void) {
       Serial.println(F("No modem detected: check wiring."));
     return;
   }
+}
 
+void testSignal(void) {
   // Test the signal quality.
   // This returns a number between 0 and 5.
   // 2 or better is preferred.
-  err = modem.getSignalQuality(signalQuality);
+  int signalQuality = -1;
+  int err = sbdModem.getSignalQuality(signalQuality);
   if (err != ISBD_SUCCESS) {
     Serial.print(F("SignalQuality failed: error "));
     Serial.println(err);
@@ -145,7 +127,9 @@ void setupModem(void) {
   Serial.print(F("On a scale of 0 to 5, signal quality is currently "));
   Serial.print(signalQuality);
   Serial.println(F("."));
+}
 
+void waitForNetwork(void) {
   // Check network available.
   Serial.println(F("Checking Network Available (for up to 60 seconds)..."));
   int NA = LOW;
@@ -161,6 +145,31 @@ void setupModem(void) {
   }
 }
 
+void enableModemPower(void) {
+  // Enable power for the 9603N
+  Serial.println(F("Enabling 9603N power..."));
+  digitalWrite(iridiumPwrEN, HIGH);  // Enable Iridium Power
+  delay(1000);
+  // If we're powering the device by USB, tell the library
+  // to relax timing constraints waiting for the supercap to recharge.
+  sbdModem.setPowerProfile(IridiumSBD::USB_POWER_PROFILE);
+}
+
+void setupModem(void) {
+  setupModemPins();
+
+  // TODO: is it really necessary
+  // Make sure the Serial1 RX pin is disabled to prevent the power-on glitch on the modem's RX(OUT) pin
+  // causing problems with v2.1.0 of the Apollo3 core. Requires v3.0.5 of IridiumSBDi2c.
+  sbdModem.endSerialPort();
+
+  setupModemSuperCap();
+  enableModemPower();
+  startModem();
+  testSignal();
+  waitForNetwork();
+}
+
 // TODO: not sure if needed - allow other threads run time during blocking calls
 bool ISBDCallback(void) {
   rtos::ThisThread::sleep_for(20);
@@ -170,16 +179,16 @@ bool ISBDCallback(void) {
 
 // TODO: verify ack
 void sendRTL() {
-  uint8_t target_system = 1; // Target drone id
-  uint8_t target_component = 0; // Target component, 0 = all
-  uint16_t command = MAV_CMD_DO_SET_MODE; // Specific command for PX4
-  uint8_t confirmation = 0; 
-  float param1 = MAV_MODE_FLAG_CUSTOM_MODE_ENABLED; 
-  float param2 = COPTER_MODE_RTL; 
-  float param3 = 0; 
-  float param4 = 0; 
-  float param5 = 0; 
-  float param6 = 0; 
+  uint8_t target_system = 1;               // Target drone id
+  uint8_t target_component = 0;            // Target component, 0 = all
+  uint16_t command = MAV_CMD_DO_SET_MODE;  // Specific command for PX4
+  uint8_t confirmation = 0;
+  float param1 = MAV_MODE_FLAG_CUSTOM_MODE_ENABLED;
+  float param2 = COPTER_MODE_RTL;
+  float param3 = 0;
+  float param4 = 0;
+  float param5 = 0;
+  float param6 = 0;
   float param7 = 0;
 
   // Initialize the required buffers
@@ -187,7 +196,7 @@ void sendRTL() {
   uint8_t buf[MAVLINK_MAX_PACKET_LEN];
 
   // Pack the message
-  mavlink_msg_command_long_pack( 1, 44, &msg, target_system, target_component, command, confirmation, param1, param2, param3, param4, param5, param6, param7);
+  mavlink_msg_command_long_pack(1, 44, &msg, target_system, target_component, command, confirmation, param1, param2, param3, param4, param5, param6, param7);
 
   // Copy the message to the send buffer
   uint16_t len = mavlink_msg_to_send_buffer(buf, &msg);
@@ -197,21 +206,20 @@ void sendRTL() {
   mavlinkSerialMutex.unlock();
 }
 
-void modemLoop() {
+void modemLoop(void) {
   static int err = ISBD_SUCCESS;
-  bool ring = modem.hasRingAsserted();
-  int waitingMessageCount = modem.getWaitingMessageCount();
+  bool ring = sbdModem.hasRingAsserted();
+  int waitingMessageCount = sbdModem.getWaitingMessageCount();
   uint32_t sendQueueSize = modemSendQueue.count();
 
-  if (ring)
-  {
+  if (ring) {
     Serial.println("Ring!");
   }
 
   if ((ring) || (waitingMessageCount > 0) || (sendQueueSize > 0)) {
     // Clear the Mobile Originated message buffer - just in case it has an old message in it!
     Serial.println(F("Clearing the MO buffer (just in case)."));
-    err = modem.clearBuffers(ISBD_CLEAR_MO);  // Clear MO buffer
+    err = sbdModem.clearBuffers(ISBD_CLEAR_MO);  // Clear MO buffer
     if (err != ISBD_SUCCESS) {
       Serial.print(F("clearBuffers failed: error "));
       Serial.println(err);
@@ -233,11 +241,11 @@ void modemLoop() {
         return;
       }
 
-      err = modem.sendReceiveSBDText(data, recvBuffer, bufferSize);
+      err = sbdModem.sendReceiveSBDText(data, recvBuffer, bufferSize);
       delete[] data;
 
     } else {
-      err = modem.sendReceiveSBDText(NULL, recvBuffer, bufferSize);
+      err = sbdModem.sendReceiveSBDText(NULL, recvBuffer, bufferSize);
     }
 
     if (err != ISBD_SUCCESS) {
@@ -246,8 +254,7 @@ void modemLoop() {
       return;
     }
 
-    if (bufferSize > 0)
-    {
+    if (bufferSize > 0) {
       Serial.println("Sending RTL command");
       sendRTL();
     }
@@ -269,7 +276,7 @@ void modemLoop() {
     while (ring == true) {
       Serial.println(F("RING is still asserted. Waiting for it to clear..."));
       rtos::ThisThread::sleep_for(500);
-      ring = modem.hasRingAsserted();
+      ring = sbdModem.hasRingAsserted();
     }
 
     Serial.println(F("RING has cleared. Begin waiting for a new RING..."));
@@ -278,7 +285,7 @@ void modemLoop() {
   rtos::ThisThread::sleep_for(1000);
 }
 
-void sendMAVLink() {
+void sendMAVLink(void) {
   while (1) {
     // Generate HEARTBEAT message buffer
     mavlink_message_t msg;
@@ -295,7 +302,7 @@ void sendMAVLink() {
   }
 }
 
-void receiveMAVLink() {
+void receiveMAVLink(void) {
   unsigned long last_position_update_millis;
   while (1) {
     mavlink_message_t msg;
@@ -312,8 +319,7 @@ void receiveMAVLink() {
 
           case MAVLINK_MSG_ID_GLOBAL_POSITION_INT:
             Serial.println("Received global position int");
-            if (((millis() - last_position_update_millis) > infoTransmissionIntervalMillis) || (infoTransmissionIntervalMillis == 0))
-            {
+            if (((millis() - last_position_update_millis) > infoTransmissionIntervalMillis) || (infoTransmissionIntervalMillis == 0)) {
               mavlink_global_position_int_t global_position_int;
               mavlink_msg_global_position_int_decode(&msg, &global_position_int);
               Serial.println("Adding message to send queue");
@@ -336,15 +342,15 @@ void receiveMAVLink() {
 }
 
 
-void setup() {
+void setup(void) {
   Serial.begin(115200);
   mavlinkSerial.begin(9600);  // We must set a low speed for softwareserial
   setupModem();
   mavlinkRxThread.start(receiveMAVLink);
-  modemThread.start(sendMAVLink);
+  mavlinkTxThread.start(sendMAVLink);
   Serial.println("Setup completed, starting loop");
 }
 
-void loop() {
+void loop(void) {
   modemLoop();
 }
