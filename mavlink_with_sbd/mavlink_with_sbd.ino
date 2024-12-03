@@ -11,6 +11,9 @@
 #define iridiumRI 41         // Input for the Iridium 9603N Ring Indicator
 
 #define sbdMessageSize 150
+#define secondToMillisecond 1e3
+#define infoTransmissionIntervalMillis 90 * secondToMillisecond
+
 
 #include <SoftwareSerial.h>
 #include <MAVLink_ardupilotmega.h>
@@ -24,9 +27,6 @@ rtos::Thread modemThread;
 rtos::Queue<char, 3> modemSendQueue;
 // TODO: use EventFlags to reduce sleep and optimize speed
 rtos::Mutex mavlinkSerialMutex;
-// Usage: connect to Wi-Fi network and use QGroundControl to open MAVLink connection
-unsigned long last_position_update_millis = 0;
-
 
 void gnssOFF(void)  // Disable power for the GNSS
 {
@@ -161,11 +161,40 @@ void setupModem(void) {
   }
 }
 
+// TODO: not sure if needed - allow other threads run time during blocking calls
 bool ISBDCallback(void) {
-  // Allow other threads run time during blocking calls
-  rtos::ThisThread::sleep_for(20);  // TODO: check if effects boot and send times
+  rtos::ThisThread::sleep_for(20);
   // Serial.println("sleeping");`
   return true;
+}
+
+// TODO: verify ack
+void sendRTL() {
+  uint8_t target_system = 1; // Target drone id
+  uint8_t target_component = 0; // Target component, 0 = all
+  uint16_t command = MAV_CMD_DO_SET_MODE; // Specific command for PX4
+  uint8_t confirmation = 0; 
+  float param1 = MAV_MODE_FLAG_CUSTOM_MODE_ENABLED; 
+  float param2 = COPTER_MODE_RTL; 
+  float param3 = 0; 
+  float param4 = 0; 
+  float param5 = 0; 
+  float param6 = 0; 
+  float param7 = 0;
+
+  // Initialize the required buffers
+  mavlink_message_t msg;
+  uint8_t buf[MAVLINK_MAX_PACKET_LEN];
+
+  // Pack the message
+  mavlink_msg_command_long_pack( 1, 44, &msg, target_system, target_component, command, confirmation, param1, param2, param3, param4, param5, param6, param7);
+
+  // Copy the message to the send buffer
+  uint16_t len = mavlink_msg_to_send_buffer(buf, &msg);
+  // Send the message (.write sends as bytes)
+  mavlinkSerialMutex.lock();
+  mavlinkSerial.write(buf, len);
+  mavlinkSerialMutex.unlock();
 }
 
 void modemLoop() {
@@ -173,6 +202,11 @@ void modemLoop() {
   bool ring = modem.hasRingAsserted();
   int waitingMessageCount = modem.getWaitingMessageCount();
   uint32_t sendQueueSize = modemSendQueue.count();
+
+  if (ring)
+  {
+    Serial.println("Ring!");
+  }
 
   if ((ring) || (waitingMessageCount > 0) || (sendQueueSize > 0)) {
     // Clear the Mobile Originated message buffer - just in case it has an old message in it!
@@ -210,6 +244,12 @@ void modemLoop() {
       Serial.print(F("sendReceiveSBDBinary failed: error "));
       Serial.println(err);
       return;
+    }
+
+    if (bufferSize > 0)
+    {
+      Serial.println("Sending RTL command");
+      sendRTL();
     }
 
     Serial.println(F("Message received!"));
@@ -256,6 +296,7 @@ void sendMAVLink() {
 }
 
 void receiveMAVLink() {
+  unsigned long last_position_update_millis;
   while (1) {
     mavlink_message_t msg;
     mavlink_status_t status;
@@ -271,7 +312,8 @@ void receiveMAVLink() {
 
           case MAVLINK_MSG_ID_GLOBAL_POSITION_INT:
             Serial.println("Received global position int");
-            if ((millis() - last_position_update_millis) > (60 * 1e3)) {
+            if (((millis() - last_position_update_millis) > infoTransmissionIntervalMillis) || (infoTransmissionIntervalMillis == 0))
+            {
               mavlink_global_position_int_t global_position_int;
               mavlink_msg_global_position_int_decode(&msg, &global_position_int);
               Serial.println("Adding message to send queue");
