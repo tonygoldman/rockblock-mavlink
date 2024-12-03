@@ -21,12 +21,11 @@ SoftwareSerial mavlinkSerial(D11, D15);  // D11 id the blue which is TX from the
 IridiumSBD modem(Serial1, iridiumSleep, iridiumRI);
 rtos::Thread mavlinkRxThread;
 rtos::Thread modemThread;
-rtos::Queue<uint8_t[sbdMessageSize], 3> modemRecvQueue;
 rtos::Queue<char[sbdMessageSize], 3> modemSendQueue;
 // TODO: use EventFlags to reduce sleep and optimize speed
 rtos::Mutex mavlinkSerialMutex;
 // Usage: connect to Wi-Fi network and use QGroundControl to open MAVLink connection
-bool a = false;
+unsigned long last_position_update_millis = 0;
 
 
 void gnssOFF(void)  // Disable power for the GNSS
@@ -104,12 +103,13 @@ void setupModem(void) {
   int err;
 
   setupModemPins();
-  setupModemSuperCap();
 
   // TODO: is it really necessary
   // Make sure the Serial1 RX pin is disabled to prevent the power-on glitch on the modem's RX(OUT) pin
   // causing problems with v2.1.0 of the Apollo3 core. Requires v3.0.5 of IridiumSBDi2c.
   modem.endSerialPort();
+
+  setupModemSuperCap();
 
   // Enable power for the 9603N
   Serial.println(F("Enabling 9603N power..."));
@@ -163,111 +163,102 @@ void setupModem(void) {
 
 bool ISBDCallback(void) {
   // Allow other threads run time during blocking calls
-  rtos::ThisThread::sleep_for(100);  // TODO: check if effects boot and send times
-  Serial.println("sleeping");
+  rtos::ThisThread::sleep_for(20);  // TODO: check if effects boot and send times
+  // Serial.println("sleeping");`
   return true;
 }
 
 void modemLoop() {
-  while (1) {
-    static int err = ISBD_SUCCESS;
-    bool ring = modem.hasRingAsserted();
-    uint8_t waitingMessageCount = modem.getWaitingMessageCount();
-    uint8_t sendQueueSize = modemSendQueue.count();
+  static int err = ISBD_SUCCESS;
+  bool ring = modem.hasRingAsserted();
+  int waitingMessageCount = modem.getWaitingMessageCount();
+  uint32_t sendQueueSize = modemSendQueue.count();
 
-    Serial.printf("ring:%d,waiting_message_count:%d,send_queue_size:%d\n", ring, waitingMessageCount, sendQueueSize);
+  Serial.printf("ring:%d,waiting_message_count:%d,send_queue_size:%d\n", modem.hasRingAsserted(), modem.getWaitingMessageCount(), sendQueueSize);
 
-    if (
-      (ring) || (waitingMessageCount > 0) || (sendQueueSize > 0)) {
-
-      if (ring)
-        Serial.println(F("RING asserted!  Let's try to read the incoming message."));
-      if (modem.getWaitingMessageCount() > 0)
-        Serial.println(F("Waiting messages available.  Let's try to read them."));
-
-      // Clear the Mobile Originated message buffer - just in case it has an old message in it!
-      Serial.println(F("Clearing the MO buffer (just in case)."));
-      err = modem.clearBuffers(ISBD_CLEAR_MO);  // Clear MO buffer
-      if (err != ISBD_SUCCESS) {
-        Serial.print(F("clearBuffers failed: error "));
-        Serial.println(err);
-        return;
-      }
-
-      uint8_t recvBuffer[sbdMessageSize];
-      size_t bufferSize = sbdMessageSize;
-
-      if (modemSendQueue.count() > 0) {
-        char sendBuffer[sbdMessageSize];  // TODO: should be optimized using pointers
-        char(*sendBufferPtr)[sbdMessageSize] = &sendBuffer;
-        bool success = modemSendQueue.try_get(&sendBufferPtr);
-
-        if (!success) {
-          Serial.println("Error: failed to get message from send queue");
-          continue;
-        }
-
-        err = modem.sendReceiveSBDText(sendBuffer, recvBuffer, bufferSize);
-      } else {
-        err = modem.sendReceiveSBDText(NULL, recvBuffer, bufferSize);
-      }
-
-      if (err != ISBD_SUCCESS) {
-        Serial.print(F("sendReceiveSBDBinary failed: error "));
-        Serial.println(err);
-        return;
-      }
-
-      if (sizeof(recvBuffer) > 0) {
-
-        modemRecvQueue.try_put(&recvBuffer);
-      }
-
-      Serial.println(F("Message received!"));
-      Serial.print(F("Inbound message size is "));
-      Serial.println(bufferSize);
-      for (int i = 0; i < (int)bufferSize; ++i) {
-        Serial.print(recvBuffer[i], HEX);
-        if (isprint(recvBuffer[i])) {
-          Serial.print(F("("));
-          Serial.write(recvBuffer[i]);
-          Serial.print(F(")"));
-        }
-        Serial.print(F(" "));
-      }
-      Serial.println();
-
-      while (ring == true) {
-        Serial.println(F("RING is still asserted. Waiting for it to clear..."));
-        rtos::ThisThread::sleep_for(500);
-        ring = modem.hasRingAsserted();
-      }
-
-      Serial.println(F("RING has cleared. Begin waiting for a new RING..."));
+  if ((ring) || (waitingMessageCount > 0) || (sendQueueSize > 0)) 
+  {
+    // Clear the Mobile Originated message buffer - just in case it has an old message in it!
+    Serial.println(F("Clearing the MO buffer (just in case)."));
+    err = modem.clearBuffers(ISBD_CLEAR_MO);  // Clear MO buffer
+    if (err != ISBD_SUCCESS) {
+      Serial.print(F("clearBuffers failed: error "));
+      Serial.println(err);
+      return;
     }
 
+    uint8_t recvBuffer[sbdMessageSize];
+    size_t bufferSize = sbdMessageSize;
+
+    if (modemSendQueue.count() > 0) {
+      char sendBuffer[sbdMessageSize];  // TODO: should be optimized using pointers
+      char(*sendBufferPtr)[sbdMessageSize] = &sendBuffer;
+      bool success = modemSendQueue.try_get(&sendBufferPtr);
+
+      if (!success) {
+        Serial.println("Error: failed to get message from send queue");
+        return;
+      }
+
+      err = modem.sendReceiveSBDText(sendBuffer, recvBuffer, bufferSize);
+    } else {
+      err = modem.sendReceiveSBDText(NULL, recvBuffer, bufferSize);
+    }
+
+    if (err != ISBD_SUCCESS) {
+      Serial.print(F("sendReceiveSBDBinary failed: error "));
+      Serial.println(err);
+      return;
+    }
+
+    Serial.println(F("Message received!"));
+    Serial.print(F("Inbound message size is "));
+    Serial.println(bufferSize);
+    for (int i = 0; i < (int)bufferSize; ++i) {
+      Serial.print(recvBuffer[i], HEX);
+      if (isprint(recvBuffer[i])) {
+        Serial.print(F("("));
+        Serial.write(recvBuffer[i]);
+        Serial.print(F(")"));
+      }
+      Serial.print(F(" "));
+    }
+    Serial.println();
+
+    while (ring == true) {
+      Serial.println(F("RING is still asserted. Waiting for it to clear..."));
+      rtos::ThisThread::sleep_for(500);
+      ring = modem.hasRingAsserted();
+    }
+
+    Serial.println(F("RING has cleared. Begin waiting for a new RING..."));
+  }
+
+  rtos::ThisThread::sleep_for(1000);
+}
+
+void sendMAVLink() {
+  while (1)
+  {
+    // Generate HEARTBEAT message buffer
+    mavlink_message_t msg;
+    uint8_t buf[MAVLINK_MAX_PACKET_LEN];
+
+    mavlink_msg_heartbeat_pack(44, MAV_COMP_ID_ONBOARD_COMPUTER, &msg, MAV_TYPE_ONBOARD_CONTROLLER, MAV_AUTOPILOT_INVALID, 0, 0, 0);
+    uint16_t len = mavlink_msg_to_send_buffer(buf, &msg);
+
+    mavlinkSerialMutex.lock();
+    // Send buffer over UDP
+    Serial.println("Sending heartbeat");
+    mavlinkSerial.write(buf, len);
+    mavlinkSerialMutex.unlock();
     rtos::ThisThread::sleep_for(1000);
   }
 }
 
-void sendMAVLink() {
-  // Generate HEARTBEAT message buffer
-  mavlink_message_t msg;
-  uint8_t buf[MAVLINK_MAX_PACKET_LEN];
-
-  mavlink_msg_heartbeat_pack(44, MAV_COMP_ID_ONBOARD_COMPUTER, &msg, MAV_TYPE_ONBOARD_CONTROLLER, MAV_AUTOPILOT_INVALID, 0, 0, 0);
-  uint16_t len = mavlink_msg_to_send_buffer(buf, &msg);
-
-  mavlinkSerialMutex.lock();
-  // Send buffer over UDP
-  Serial.println("Sending heartbeat");
-  mavlinkSerial.write(buf, len);
-  mavlinkSerialMutex.unlock();
-  rtos::ThisThread::sleep_for(1000);
-}
-
 void receiveMAVLink() {
-  while (1) {
+  while (1) 
+  {
     mavlink_message_t msg;
     mavlink_status_t status;
     uint8_t buf[MAVLINK_MAX_PACKET_LEN];
@@ -278,16 +269,19 @@ void receiveMAVLink() {
         switch (msg.msgid) {
           case MAVLINK_MSG_ID_HEARTBEAT:
             Serial.println("Received heartbeat");
-            if (!a) {
-              char send_rockblock[sbdMessageSize];
-              sprintf(send_rockblock, "%s", msg.sysid);
-              modemSendQueue.try_put(&send_rockblock);
-              a = true;
-            }
             break;
 
           case MAVLINK_MSG_ID_GLOBAL_POSITION_INT:
             Serial.println("Received global position int");
+            if ((millis() - last_position_update_millis) > (60 * 1e3)){
+              mavlink_global_position_int_t global_position_int;
+              mavlink_msg_global_position_int_decode(&msg, &global_position_int);
+              Serial.println("Adding message to send queue");
+              last_position_update_millis = millis();
+              char data[sbdMessageSize];
+              sprintf(data, "lat: %d, long: %d, alt: %d, time: %d", global_position_int.lat, global_position_int.lon, global_position_int.alt, global_position_int.time_boot_ms);
+              modemSendQueue.try_put(&data);
+            }
             break;
 
             // default:
@@ -306,11 +300,11 @@ void setup() {
   Serial.begin(115200);
   mavlinkSerial.begin(9600);  // We must set a low speed for softwareserial
   setupModem();
-  // mavlinkRxThread.start(receiveMAVLink);
-  modemThread.start(modemLoop);
+  mavlinkRxThread.start(receiveMAVLink);
+  modemThread.start(sendMAVLink);
   Serial.println("Setup completed, starting loop");
 }
 
 void loop() {
-  // sendMAVLink();
+  modemLoop();
 }
