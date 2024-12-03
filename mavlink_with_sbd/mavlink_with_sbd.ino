@@ -21,7 +21,7 @@ SoftwareSerial mavlinkSerial(D11, D15);  // D11 id the blue which is TX from the
 IridiumSBD modem(Serial1, iridiumSleep, iridiumRI);
 rtos::Thread mavlinkRxThread;
 rtos::Thread modemThread;
-rtos::Queue<char[sbdMessageSize], 3> modemSendQueue;
+rtos::Queue<char, 3> modemSendQueue;
 // TODO: use EventFlags to reduce sleep and optimize speed
 rtos::Mutex mavlinkSerialMutex;
 // Usage: connect to Wi-Fi network and use QGroundControl to open MAVLink connection
@@ -174,10 +174,7 @@ void modemLoop() {
   int waitingMessageCount = modem.getWaitingMessageCount();
   uint32_t sendQueueSize = modemSendQueue.count();
 
-  Serial.printf("ring:%d,waiting_message_count:%d,send_queue_size:%d\n", modem.hasRingAsserted(), modem.getWaitingMessageCount(), sendQueueSize);
-
-  if ((ring) || (waitingMessageCount > 0) || (sendQueueSize > 0)) 
-  {
+  if ((ring) || (waitingMessageCount > 0) || (sendQueueSize > 0)) {
     // Clear the Mobile Originated message buffer - just in case it has an old message in it!
     Serial.println(F("Clearing the MO buffer (just in case)."));
     err = modem.clearBuffers(ISBD_CLEAR_MO);  // Clear MO buffer
@@ -191,16 +188,20 @@ void modemLoop() {
     size_t bufferSize = sbdMessageSize;
 
     if (modemSendQueue.count() > 0) {
-      char sendBuffer[sbdMessageSize];  // TODO: should be optimized using pointers
-      char(*sendBufferPtr)[sbdMessageSize] = &sendBuffer;
-      bool success = modemSendQueue.try_get(&sendBufferPtr);
+      char* data = nullptr;  // TODO: should be optimized using pointers
+      bool success = modemSendQueue.try_get(&data);
+      Serial.print("Sending: ");
+      Serial.println(data);
+
 
       if (!success) {
         Serial.println("Error: failed to get message from send queue");
         return;
       }
 
-      err = modem.sendReceiveSBDText(sendBuffer, recvBuffer, bufferSize);
+      err = modem.sendReceiveSBDText(data, recvBuffer, bufferSize);
+      delete[] data;
+
     } else {
       err = modem.sendReceiveSBDText(NULL, recvBuffer, bufferSize);
     }
@@ -238,8 +239,7 @@ void modemLoop() {
 }
 
 void sendMAVLink() {
-  while (1)
-  {
+  while (1) {
     // Generate HEARTBEAT message buffer
     mavlink_message_t msg;
     uint8_t buf[MAVLINK_MAX_PACKET_LEN];
@@ -248,8 +248,7 @@ void sendMAVLink() {
     uint16_t len = mavlink_msg_to_send_buffer(buf, &msg);
 
     mavlinkSerialMutex.lock();
-    // Send buffer over UDP
-    Serial.println("Sending heartbeat");
+    // Serial.println("Sending heartbeat");
     mavlinkSerial.write(buf, len);
     mavlinkSerialMutex.unlock();
     rtos::ThisThread::sleep_for(1000);
@@ -257,8 +256,7 @@ void sendMAVLink() {
 }
 
 void receiveMAVLink() {
-  while (1) 
-  {
+  while (1) {
     mavlink_message_t msg;
     mavlink_status_t status;
     uint8_t buf[MAVLINK_MAX_PACKET_LEN];
@@ -268,19 +266,19 @@ void receiveMAVLink() {
       if (mavlink_parse_char(MAVLINK_COMM_0, c, &msg, &status)) {
         switch (msg.msgid) {
           case MAVLINK_MSG_ID_HEARTBEAT:
-            Serial.println("Received heartbeat");
+            // Serial.println("Received heartbeat");
             break;
 
           case MAVLINK_MSG_ID_GLOBAL_POSITION_INT:
             Serial.println("Received global position int");
-            if ((millis() - last_position_update_millis) > (60 * 1e3)){
+            if ((millis() - last_position_update_millis) > (60 * 1e3)) {
               mavlink_global_position_int_t global_position_int;
               mavlink_msg_global_position_int_decode(&msg, &global_position_int);
               Serial.println("Adding message to send queue");
               last_position_update_millis = millis();
-              char data[sbdMessageSize];
+              char* data = new char[sbdMessageSize];
               sprintf(data, "lat: %d, long: %d, alt: %d, time: %d", global_position_int.lat, global_position_int.lon, global_position_int.alt, global_position_int.time_boot_ms);
-              modemSendQueue.try_put(&data);
+              modemSendQueue.try_put(data);
             }
             break;
 
