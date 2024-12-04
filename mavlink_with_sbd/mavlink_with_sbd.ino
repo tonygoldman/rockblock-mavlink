@@ -4,58 +4,89 @@
 #include <IridiumSBD.h>
 
 // consts from the artemis sbd example
-#define busVoltagePin 13     // Bus voltage divided by 3 (Analog in)
-#define iridiumSleep 17      // Iridium 9603N ON/OFF (sleep) pin: pull high to enable the 9603N
-#define iridiumNA 18         // Input for the Iridium 9603N Network Available
-#define LED 19               // White LED
-#define iridiumPwrEN 22      // ADM4210 ON: pull high to enable power for the Iridium 9603N
-#define gnssEN 26            // GNSS Enable: pull low to enable power for the GNSS (via Q2)
-#define gnssBckpBatChgEN 44  // GNSS backup battery charge enable; when set as INPUT = disabled, when OUTPUT+LOW = charging.
-#define superCapChgEN 27     // LTC3225 super capacitor charger: pull high to enable the super capacitor charger
-#define superCapPGOOD 28     // Input for the LTC3225 super capacitor charger PGOOD signal
-#define busVoltageMonEN 34   // Bus voltage monitor enable: pull high to enable bus voltage monitoring (via Q4 and Q3)
-#define iridiumRI 41         // Input for the Iridium 9603N Ring Indicator
+#define BUS_VOLTAGE_PIN (13)                        // Bus voltage divided by 3 (Analog in)
+#define IRIDIUM_SLEEP_PIN (17)                      // Iridium 9603N ON/OFF (sleep) pin: pull high to enable the 9603N
+#define IRIDIUM_NA_PIN (18)                         // Input for the Iridium 9603N Network Available
+#define IRIDIUM_ENABLE_PIN (22)                     // ADM4210 ON: pull high to enable power for the Iridium 9603N
+#define IRIDIUM_RING_PIN (41)                       // Input for the Iridium 9603N Ring Indicator
+#define GNSS_ENABLE_PIN (26)                        // GNSS Enable: pull low to enable power for the GNSS (via Q2)
+#define GNSS_BACKUP_BATTERY_CHARGE_ENABLE_PIN (44)  // GNSS backup battery charge enable; when set as INPUT = disabled, when OUTPUT+LOW = charging.
+#define SUPER_CAPACITOR_CHARGE_ENABLE_PIN (27)      // LTC3225 super capacitor charger: pull high to enable the super capacitor charger
+#define SUPER_CAPACITOR_PGOOD_PIN (28)              // Input for the LTC3225 super capacitor charger PGOOD signal
+#define BUS_VOLTAGE_MONITOR_ENABLE_PIN (34)         // Bus voltage monitor enable: pull high to enable bus voltage monitoring (via Q4 and Q3)
 // project consts
-#define sbdMaxMessageSize 150
-#define sendQueueMessageCount 3
-#define secondToMillisecond 1e3
-#define infoTransmissionIntervalMillis 90 * secondToMillisecond
+#define SBD_MAX_MESSAGE_SIZE (150)
+#define SEND_QUEUE_MESSAGE_COUNT (3)
+#define SECOND_TO_MILLIS (1e3)
+#define DRONE_STATUS_TRANSMISSION_INTERVAL_SEC (90)
+#define SBD_SEND_EVENT (1UL << 0)
+#define RTL_EVENT (1UL << 1)
+#define STATUS_MSG_FORMAT ("{'lat':%d,'lon':%d,'relative_alt':%d,'hdg':%u,'roll':%.2f,'pitch':%.2f,'yaw':%.2f,'custom_mode':%u,'voltage_battery':%u,'time_unix_usec':%llu}")
 
 typedef struct __drone_status_t {
   // from global position int
-  int32_t lat;          /*< [degE7] Latitude, expressed*/
-  int32_t lon;          /*< [degE7] Longitude, expressed*/
-  int32_t relative_alt; /*< [mm] Altitude above home*/
-  uint16_t hdg;         /*< [cdeg] Vehicle heading (yaw angle), 0.0..359.99 degrees. If unknown, set to: UINT16_MAX*/
+  int32_t lat = 0;          /*< [degE7] Latitude, expressed*/
+  int32_t lon = 0;          /*< [degE7] Longitude, expressed*/
+  int32_t relative_alt = 0; /*< [mm] Altitude above home*/
+  uint16_t hdg = 0;         /*< [cdeg] Vehicle heading (yaw angle), 0.0..359.99 degrees. If unknown, set to: UINT16_MAX*/
   // from attitude
-  float roll;  /*< [rad] Roll angle (-pi..+pi)*/
-  float pitch; /*< [rad] Pitch angle (-pi..+pi)*/
-  float yaw;   /*< [rad] Yaw angle (-pi..+pi)*/
+  float roll = 0;  /*< [rad] Roll angle (-pi..+pi)*/
+  float pitch = 0; /*< [rad] Pitch angle (-pi..+pi)*/
+  float yaw = 0;   /*< [rad] Yaw angle (-pi..+pi)*/
   // from heartbeat
-  uint32_t custom_mode; /*<  A bitfield for use for autopilot-specific flags*/
+  uint32_t custom_mode = 0; /*<  A bitfield for use for autopilot-specific flags*/
   // from sys status
-  uint16_t voltage_battery; /*< [mV] Battery voltage, UINT16_MAX: Voltage not sent by autopilot*/
+  uint16_t voltage_battery = 0; /*< [mV] Battery voltage, UINT16_MAX: Voltage not sent by autopilot*/
   // from system time
-  uint64_t time_unix_usec; /*< [us] Timestamp (UNIX epoch time).*/
+  uint64_t time_unix_usec = 0; /*< [us] Timestamp (UNIX epoch time).*/
 } drone_status_t;
 
+enum class sbdState : uint8_t {
+  BOOTING,
+  NO_CONNECTION,
+  IDLE,
+  SENDRECV,
+  ERROR
+};
+
 SoftwareSerial mavlinkSerial(D11, D15);  // D11 id the blue which is TX from the pixhawk, D15 is the purple which is RX from the pixhawk
-IridiumSBD sbdModem(Serial1, iridiumSleep, iridiumRI);
+IridiumSBD sbdModem(Serial1, IRIDIUM_SLEEP_PIN, IRIDIUM_RING_PIN);
 rtos::Thread mavlinkRxThread;
-rtos::Thread mavlinkTxThread;
-// TODO: use eventflags to publish message
-rtos::Queue<char, 3> modemSendQueue;
+rtos::Thread mavlinkHeartbeatThread;
+rtos::Thread mavlinkRtlThread;
+rtos::Thread sendDroneStatusThread;
 rtos::Mutex mavlinkSerialMutex;
-char sbdSendQueue[sendQueueMessageCount * sbdMaxMessageSize]
+rtos::EventFlags event_flags;
+char sbdSendQueue[SEND_QUEUE_MESSAGE_COUNT * SBD_MAX_MESSAGE_SIZE];
+drone_status_t droneStatus;
+enum sbdState sbd_state = sbdState::BOOTING;
+
+void droneStatusMessage(char* message) {
+  snprintf(
+    message,
+    SBD_MAX_MESSAGE_SIZE,
+    STATUS_MSG_FORMAT,
+    droneStatus.lat,
+    droneStatus.lon,
+    droneStatus.relative_alt,
+    droneStatus.hdg,
+    droneStatus.roll,
+    droneStatus.pitch,
+    droneStatus.yaw,
+    droneStatus.custom_mode,
+    droneStatus.voltage_battery,
+    droneStatus.time_unix_usec);
+}
+
 
 void gnssOFF(void)  // Disable power for the GNSS
 {
-  am_hal_gpio_pincfg_t pinCfg = g_AM_HAL_GPIO_OUTPUT;  // Begin by making the gnssEN pin an open-drain output
+  am_hal_gpio_pincfg_t pinCfg = g_AM_HAL_GPIO_OUTPUT;  // Begin by making the GNSS_ENABLE_PIN pin an open-drain output
   pinCfg.eGPOutcfg = AM_HAL_GPIO_PIN_OUTCFG_OPENDRAIN;
-  pin_config(PinName(gnssEN), pinCfg);
+  pin_config(PinName(GNSS_ENABLE_PIN), pinCfg);
   delay(1);
 
-  digitalWrite(gnssEN, HIGH);  // Disable GNSS power (HIGH = disable; LOW = enable)
+  digitalWrite(GNSS_ENABLE_PIN, HIGH);  // Disable GNSS power (HIGH = disable; LOW = enable)
 }
 
 // TODO: is it really necessary
@@ -88,30 +119,28 @@ void IridiumSBD::endSerialPort(void) {
 }
 
 void setupModemPins(void) {
-  pinMode(LED, OUTPUT);  // Make the LED pin an output
+  gnssOFF();                                              // Disable power for the GNSS
+  pinMode(GNSS_BACKUP_BATTERY_CHARGE_ENABLE_PIN, INPUT);  // GNSS backup batttery charge control; input = disable charging; output+low=charging.
 
-  gnssOFF();                         // Disable power for the GNSS
-  pinMode(gnssBckpBatChgEN, INPUT);  // GNSS backup batttery charge control; input = disable charging; output+low=charging.
-
-  pinMode(iridiumPwrEN, OUTPUT);     // Configure the Iridium Power Pin (connected to the ADM4210 ON pin)
-  digitalWrite(iridiumPwrEN, LOW);   // Disable Iridium Power (HIGH = enable; LOW = disable)
-  pinMode(superCapChgEN, OUTPUT);    // Configure the super capacitor charger enable pin (connected to LTC3225 !SHDN)
-  digitalWrite(superCapChgEN, LOW);  // Disable the super capacitor charger (HIGH = enable; LOW = disable)
-  pinMode(iridiumSleep, OUTPUT);     // Iridium 9603N On/Off (Sleep) pin
-  digitalWrite(iridiumSleep, LOW);   // Put the Iridium 9603N to sleep (HIGH = on; LOW = off/sleep)
-  pinMode(iridiumRI, INPUT);         // Configure the Iridium Ring Indicator as an input
-  pinMode(iridiumNA, INPUT);         // Configure the Iridium Network Available as an input
-  pinMode(superCapPGOOD, INPUT);     // Configure the super capacitor charger PGOOD input
+  pinMode(IRIDIUM_ENABLE_PIN, OUTPUT);                   // Configure the Iridium Power Pin (connected to the ADM4210 ON pin)
+  digitalWrite(IRIDIUM_ENABLE_PIN, LOW);                 // Disable Iridium Power (HIGH = enable; LOW = disable)
+  pinMode(SUPER_CAPACITOR_CHARGE_ENABLE_PIN, OUTPUT);    // Configure the super capacitor charger enable pin (connected to LTC3225 !SHDN)
+  digitalWrite(SUPER_CAPACITOR_CHARGE_ENABLE_PIN, LOW);  // Disable the super capacitor charger (HIGH = enable; LOW = disable)
+  pinMode(IRIDIUM_SLEEP_PIN, OUTPUT);                    // Iridium 9603N On/Off (Sleep) pin
+  digitalWrite(IRIDIUM_SLEEP_PIN, LOW);                  // Put the Iridium 9603N to sleep (HIGH = on; LOW = off/sleep)
+  pinMode(IRIDIUM_RING_PIN, INPUT);                      // Configure the Iridium Ring Indicator as an input
+  pinMode(IRIDIUM_NA_PIN, INPUT);                        // Configure the Iridium Network Available as an input
+  pinMode(SUPER_CAPACITOR_PGOOD_PIN, INPUT);             // Configure the super capacitor charger PGOOD input
 }
 
 void setupModemSuperCap(void) {
   // Enable the supercapacitor charger
   Serial.println(F("Enabling the supercapacitor charger..."));
-  digitalWrite(superCapChgEN, HIGH);  // Enable the super capacitor charger
+  digitalWrite(SUPER_CAPACITOR_CHARGE_ENABLE_PIN, HIGH);  // Enable the super capacitor charger
   delay(1000);
 
   // Wait for the supercapacitor charger PGOOD signal to go high
-  while (digitalRead(superCapPGOOD) == false) {
+  while (digitalRead(SUPER_CAPACITOR_PGOOD_PIN) == false) {
     Serial.println(F("Waiting for supercapacitors to charge..."));
     delay(1000);
   }
@@ -155,7 +184,7 @@ void waitForNetwork(void) {
   int NA = LOW;
   int loop_count = 0;
   while ((NA == LOW) && (loop_count < 60)) {
-    NA = digitalRead(iridiumNA);
+    NA = digitalRead(IRIDIUM_NA_PIN);
     Serial.print(F("Network is "));
     if (NA == LOW) Serial.print(F("NOT "));
     Serial.println(F("available!"));
@@ -168,7 +197,7 @@ void waitForNetwork(void) {
 void enableModemPower(void) {
   // Enable power for the 9603N
   Serial.println(F("Enabling 9603N power..."));
-  digitalWrite(iridiumPwrEN, HIGH);  // Enable Iridium Power
+  digitalWrite(IRIDIUM_ENABLE_PIN, HIGH);  // Enable Iridium Power
   delay(1000);
   // If we're powering the device by USB, tell the library
   // to relax timing constraints waiting for the supercap to recharge.
@@ -176,6 +205,7 @@ void enableModemPower(void) {
 }
 
 void setupModem(void) {
+  Serial.println("Initializing modem");
   setupModemPins();
 
   // TODO: is it really necessary
@@ -187,7 +217,9 @@ void setupModem(void) {
   enableModemPower();
   startModem();
   testSignal();
+  sbd_state = sbdState::NO_CONNECTION;
   waitForNetwork();
+  sbd_state = sbdState::IDLE;
 }
 
 // TODO: verify ack
@@ -221,13 +253,13 @@ void modemLoop(void) {
   static int err = ISBD_SUCCESS;
   bool ring = sbdModem.hasRingAsserted();
   int waitingMessageCount = sbdModem.getWaitingMessageCount();
-  uint32_t sendQueueSize = modemSendQueue.count();
+  bool isSendEventSet = event_flags.get() & SBD_SEND_EVENT;
 
   if (ring) {
     Serial.println("Ring!");
   }
 
-  if ((ring) || (waitingMessageCount > 0) || (sendQueueSize > 0)) {
+  if ((ring) || (waitingMessageCount > 0) || (isSendEventSet)) {
     // Clear the Mobile Originated message buffer - just in case it has an old message in it!
     Serial.println(F("Clearing the MO buffer (just in case)."));
     err = sbdModem.clearBuffers(ISBD_CLEAR_MO);  // Clear MO buffer
@@ -237,52 +269,45 @@ void modemLoop(void) {
       return;
     }
 
-    uint8_t recvBuffer[sbdMaxMessageSize];
-    size_t bufferSize = sbdMaxMessageSize;
+    uint8_t recvBuffer[SBD_MAX_MESSAGE_SIZE];
+    size_t bufferSize = SBD_MAX_MESSAGE_SIZE;
 
-    if (modemSendQueue.count() > 0) {
-      char* data = nullptr;  // TODO: should be optimized using pointers
-      bool success = modemSendQueue.try_get(&data);
+    sbd_state = sbdState::SENDRECV;
+    if (isSendEventSet) {
+      char message[SBD_MAX_MESSAGE_SIZE];
+      droneStatusMessage(message);
       Serial.print("Sending: ");
-      Serial.println(data);
-
-
-      if (!success) {
-        Serial.println("Error: failed to get message from send queue");
-        return;
-      }
-
-      err = sbdModem.sendReceiveSBDText(data, recvBuffer, bufferSize);
-      delete[] data;
+      Serial.println(message);
+      err = sbdModem.sendReceiveSBDText(message, recvBuffer, bufferSize);
 
     } else {
       err = sbdModem.sendReceiveSBDText(NULL, recvBuffer, bufferSize);
     }
 
+
     if (err != ISBD_SUCCESS) {
       Serial.print(F("sendReceiveSBDBinary failed: error "));
       Serial.println(err);
+      sbd_state = sbdState::ERROR;
       return;
+    } else {
+      sbd_state = sbdState::IDLE;
     }
 
     if (bufferSize > 0) {
-      Serial.println("Sending RTL command");
-      sendRTL();
+      Serial.println("Setting RTL flag");
+      event_flags.set(RTL_EVENT);
     }
 
-    Serial.println(F("Message received!"));
-    Serial.print(F("Inbound message size is "));
-    Serial.println(bufferSize);
+    Serial.print(F("Message received: "));
     for (int i = 0; i < (int)bufferSize; ++i) {
-      Serial.print(recvBuffer[i], HEX);
       if (isprint(recvBuffer[i])) {
-        Serial.print(F("("));
         Serial.write(recvBuffer[i]);
-        Serial.print(F(")"));
       }
-      Serial.print(F(" "));
     }
     Serial.println();
+    Serial.print(F("Inbound message size is "));
+    Serial.println(bufferSize);
 
     while (ring == true) {
       Serial.println(F("RING is still asserted. Waiting for it to clear..."));
@@ -296,13 +321,13 @@ void modemLoop(void) {
   rtos::ThisThread::sleep_for(1000);
 }
 
-void sendMAVLink(void) {
+void sendHeartbeat(void) {
   while (1) {
     // Generate HEARTBEAT message buffer
     mavlink_message_t msg;
     uint8_t buf[MAVLINK_MAX_PACKET_LEN];
 
-    mavlink_msg_heartbeat_pack(44, MAV_COMP_ID_ONBOARD_COMPUTER, &msg, MAV_TYPE_ONBOARD_CONTROLLER, MAV_AUTOPILOT_INVALID, 0, 0, 0);
+    mavlink_msg_heartbeat_pack(44, MAV_COMP_ID_ONBOARD_COMPUTER, &msg, MAV_TYPE_ONBOARD_CONTROLLER, MAV_AUTOPILOT_INVALID, 0, 0, static_cast<uint8_t>(sbd_state));
     uint16_t len = mavlink_msg_to_send_buffer(buf, &msg);
 
     mavlinkSerialMutex.lock();
@@ -313,37 +338,75 @@ void sendMAVLink(void) {
   }
 }
 
+void parseHeartbeat(mavlink_message_t* msg) {
+  Serial.println("Parsing heartbeat");
+  mavlink_heartbeat_t heartbeat;
+  mavlink_msg_heartbeat_decode(msg, &heartbeat);
+  droneStatus.custom_mode = heartbeat.custom_mode;
+}
+
+void parseGlobalPositionInt(mavlink_message_t* msg) {
+  Serial.println("Parsing global position int");
+  mavlink_global_position_int_t globalPositionInt;
+  mavlink_msg_global_position_int_decode(msg, &globalPositionInt);
+  droneStatus.lat = globalPositionInt.lat;
+  droneStatus.lon = globalPositionInt.lon;
+  droneStatus.hdg = globalPositionInt.hdg;
+  droneStatus.relative_alt = globalPositionInt.relative_alt;
+}
+
+void parseAttitude(mavlink_message_t* msg) {
+  Serial.println("Parsing attitude");
+  mavlink_attitude_t attitude;
+  mavlink_msg_attitude_decode(msg, &attitude);
+  droneStatus.roll = attitude.roll;
+  droneStatus.pitch = attitude.pitch;
+  droneStatus.yaw = attitude.yaw;
+}
+
+void parseSysStatus(mavlink_message_t* msg) {
+  Serial.println("Parsing sys status");
+  mavlink_sys_status_t sysStatus;
+  mavlink_msg_sys_status_decode(msg, &sysStatus);
+  droneStatus.voltage_battery = sysStatus.voltage_battery;
+}
+
+void parseSystemTime(mavlink_message_t* msg) {
+  Serial.println("Parsing sys status");
+  mavlink_system_time_t systemTime;
+  mavlink_msg_system_time_decode(msg, &systemTime);
+  droneStatus.time_unix_usec = systemTime.time_unix_usec;
+}
+
 void receiveMAVLink(void) {
-  unsigned long last_position_update_millis;
+  int16_t lastReadChar;
   while (1) {
     mavlink_message_t msg;
     mavlink_status_t status;
     uint8_t buf[MAVLINK_MAX_PACKET_LEN];
     mavlinkSerialMutex.lock();
-    while (mavlinkSerial.available() > 0) {
-      uint8_t c = mavlinkSerial.read();
-      if (mavlink_parse_char(MAVLINK_COMM_0, c, &msg, &status)) {
+    while ((lastReadChar = mavlinkSerial.read()) != -1) {
+      if (mavlink_parse_char(MAVLINK_COMM_0, lastReadChar, &msg, &status)) {
         switch (msg.msgid) {
           case MAVLINK_MSG_ID_HEARTBEAT:
-            // Serial.println("Received heartbeat");
+            parseHeartbeat(&msg);
             break;
 
           case MAVLINK_MSG_ID_GLOBAL_POSITION_INT:
-            Serial.println("Received global position int");
-            if (((millis() - last_position_update_millis) > infoTransmissionIntervalMillis) || (infoTransmissionIntervalMillis == 0)) {
-              mavlink_global_position_int_t global_position_int;
-              mavlink_msg_global_position_int_decode(&msg, &global_position_int);
-              Serial.println("Adding message to send queue");
-              last_position_update_millis = millis();
-              char* data = new char[sbdMaxMessageSize];
-              sprintf(data, "lat: %d, long: %d, alt: %d, time: %d", global_position_int.lat, global_position_int.lon, global_position_int.alt, global_position_int.time_boot_ms);
-              modemSendQueue.try_put(data);
-            }
+            parseGlobalPositionInt(&msg);
             break;
 
-            // default:
-            //   Serial.print("Received message with ID ");
-            //   Serial.println(msg.msgid);
+          case MAVLINK_MSG_ID_ATTITUDE:
+            parseAttitude(&msg);
+            break;
+
+          case MAVLINK_MSG_ID_SYS_STATUS:
+            parseSysStatus(&msg);
+            break;
+
+          case MAVLINK_MSG_ID_SYSTEM_TIME:
+            parseSystemTime(&msg);
+            break;
         }
       }
     }
@@ -352,13 +415,29 @@ void receiveMAVLink(void) {
   }
 }
 
+void sendRtlRequest(void) {
+  while (1) {
+    event_flags.wait_all(RTL_EVENT);
+    sendRTL();
+  }
+}
+
+void setSbdSendFlag(void) {
+  while (1) {
+    event_flags.set(SBD_SEND_EVENT);
+    rtos::ThisThread::sleep_for(DRONE_STATUS_TRANSMISSION_INTERVAL_SEC * SECOND_TO_MILLIS);
+  }
+}
 
 void setup(void) {
   Serial.begin(115200);
   mavlinkSerial.begin(9600);  // We must set a low speed for softwareserial
-  setupModem();
   mavlinkRxThread.start(receiveMAVLink);
-  mavlinkTxThread.start(sendMAVLink);
+  mavlinkHeartbeatThread.start(sendHeartbeat);
+  mavlinkRtlThread.start(sendRtlRequest);
+  sendDroneStatusThread.start(setSbdSendFlag);
+  Serial.println("Threads started successfully");
+  setupModem();
   Serial.println("Setup completed, starting loop");
 }
 
