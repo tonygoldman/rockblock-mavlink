@@ -21,7 +21,7 @@
 #define DRONE_STATUS_TRANSMISSION_INTERVAL_SEC (90)
 #define SBD_SEND_EVENT (1UL << 0)
 #define RTL_EVENT (1UL << 1)
-#define STATUS_MSG_FORMAT ("{'lat':%d,'lon':%d,'relative_alt':%d,'hdg':%u,'roll':%.2f,'pitch':%.2f,'yaw':%.2f,'custom_mode':%u,'voltage_battery':%u,'time_unix_usec':%llu}")
+#define STATUS_MSG_FORMAT ("{'lat':%d,'lon':%d,'relative_alt':%d,'hdg':%u,'mode':%u,'voltage':%u,'time':%llu}")
 
 typedef struct __drone_status_t {
   // from global position int
@@ -60,6 +60,14 @@ rtos::EventFlags event_flags;
 char sbdSendQueue[SEND_QUEUE_MESSAGE_COUNT * SBD_MAX_MESSAGE_SIZE];
 drone_status_t droneStatus;
 enum sbdState sbd_state = sbdState::BOOTING;
+uint32_t counter = 0;
+
+bool ISBDCallback(void) {
+  if ((millis() % 1000) == 0) {
+    Serial.println("Still sending");
+  }
+  return true;
+}
 
 void droneStatusMessage(char* message) {
   snprintf(
@@ -70,9 +78,6 @@ void droneStatusMessage(char* message) {
     droneStatus.lon,
     droneStatus.relative_alt,
     droneStatus.hdg,
-    droneStatus.roll,
-    droneStatus.pitch,
-    droneStatus.yaw,
     droneStatus.custom_mode,
     droneStatus.voltage_battery,
     droneStatus.time_unix_usec);
@@ -279,7 +284,7 @@ void modemLoop(void) {
       Serial.print("Sending: ");
       Serial.println(message);
       err = sbdModem.sendReceiveSBDText(message, recvBuffer, bufferSize);
-
+      event_flags.clear(SBD_SEND_EVENT);
     } else {
       err = sbdModem.sendReceiveSBDText(NULL, recvBuffer, bufferSize);
     }
@@ -299,16 +304,18 @@ void modemLoop(void) {
       event_flags.set(RTL_EVENT);
     }
 
-    Serial.print(F("Message received: "));
-    for (int i = 0; i < (int)bufferSize; ++i) {
-      if (isprint(recvBuffer[i])) {
-        Serial.write(recvBuffer[i]);
+    if (bufferSize > 0) {
+      Serial.print(F("Message received: "));
+      for (int i = 0; i < (int)bufferSize; ++i) {
+        if (isprint(recvBuffer[i])) {
+          Serial.write(recvBuffer[i]);
+        }
       }
+      Serial.println();
+      Serial.print(F("Inbound message size is "));
+      Serial.println(bufferSize);
     }
-    Serial.println();
-    Serial.print(F("Inbound message size is "));
-    Serial.println(bufferSize);
-
+    
     while (ring == true) {
       Serial.println(F("RING is still asserted. Waiting for it to clear..."));
       rtos::ThisThread::sleep_for(500);
