@@ -21,7 +21,7 @@
 #define DRONE_STATUS_TRANSMISSION_INTERVAL_SEC (90)
 #define SBD_SEND_EVENT (1UL << 0)
 #define RTL_EVENT (1UL << 1)
-#define STATUS_MSG_FORMAT ("{'lat':%d,'lon':%d,'relative_alt':%d,'hdg':%u,'mode':%u,'voltage':%u,'time':%llu}")
+#define STATUS_MSG_FORMAT ("{'signal':%d,'lat':%d,'lon':%d,'relative_alt':%d,'hdg':%u,'mode':%u,'voltage':%u,'time':%llu}")
 
 typedef struct __drone_status_t {
   // from global position int
@@ -70,10 +70,13 @@ bool ISBDCallback(void) {
 }
 
 void droneStatusMessage(char* message) {
+  int signalQuality = -1;
+  sbdModem.getSignalQuality(signalQuality);
   snprintf(
     message,
     SBD_MAX_MESSAGE_SIZE,
     STATUS_MSG_FORMAT,
+    signalQuality,
     droneStatus.lat,
     droneStatus.lon,
     droneStatus.relative_alt,
@@ -315,7 +318,7 @@ void modemLoop(void) {
       Serial.print(F("Inbound message size is "));
       Serial.println(bufferSize);
     }
-    
+
     while (ring == true) {
       Serial.println(F("RING is still asserted. Waiting for it to clear..."));
       rtos::ThisThread::sleep_for(500);
