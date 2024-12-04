@@ -21,6 +21,24 @@
 #define secondToMillisecond 1e3
 #define infoTransmissionIntervalMillis 90 * secondToMillisecond
 
+typedef struct __drone_status_t {
+  // from global position int
+  int32_t lat;          /*< [degE7] Latitude, expressed*/
+  int32_t lon;          /*< [degE7] Longitude, expressed*/
+  int32_t relative_alt; /*< [mm] Altitude above home*/
+  uint16_t hdg;         /*< [cdeg] Vehicle heading (yaw angle), 0.0..359.99 degrees. If unknown, set to: UINT16_MAX*/
+  // from attitude
+  float roll;  /*< [rad] Roll angle (-pi..+pi)*/
+  float pitch; /*< [rad] Pitch angle (-pi..+pi)*/
+  float yaw;   /*< [rad] Yaw angle (-pi..+pi)*/
+  // from heartbeat
+  uint32_t custom_mode; /*<  A bitfield for use for autopilot-specific flags*/
+  // from sys status
+  uint16_t voltage_battery; /*< [mV] Battery voltage, UINT16_MAX: Voltage not sent by autopilot*/
+  // from system time
+  uint64_t time_unix_usec; /*< [us] Timestamp (UNIX epoch time).*/
+} drone_status_t;
+
 SoftwareSerial mavlinkSerial(D11, D15);  // D11 id the blue which is TX from the pixhawk, D15 is the purple which is RX from the pixhawk
 IridiumSBD sbdModem(Serial1, iridiumSleep, iridiumRI);
 rtos::Thread mavlinkRxThread;
