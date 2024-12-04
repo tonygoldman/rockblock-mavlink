@@ -16,7 +16,8 @@
 #define busVoltageMonEN 34   // Bus voltage monitor enable: pull high to enable bus voltage monitoring (via Q4 and Q3)
 #define iridiumRI 41         // Input for the Iridium 9603N Ring Indicator
 // project consts
-#define sbdMessageSize 150
+#define sbdMaxMessageSize 150
+#define sendQueueMessageCount 3
 #define secondToMillisecond 1e3
 #define infoTransmissionIntervalMillis 90 * secondToMillisecond
 
@@ -27,6 +28,7 @@ rtos::Thread mavlinkTxThread;
 // TODO: use eventflags to publish message
 rtos::Queue<char, 3> modemSendQueue;
 rtos::Mutex mavlinkSerialMutex;
+char sbdSendQueue[sendQueueMessageCount * sbdMaxMessageSize]
 
 void gnssOFF(void)  // Disable power for the GNSS
 {
@@ -170,14 +172,6 @@ void setupModem(void) {
   waitForNetwork();
 }
 
-// TODO: not sure if needed - allow other threads run time during blocking calls
-// iridiumSBD calls this callback repeatedly during long blocking operations
-// bool ISBDCallback(void) {
-  // rtos::ThisThread::yield();
-  // Serial.println("sleeping");`
-  // return true;
-// }
-
 // TODO: verify ack
 void sendRTL() {
   uint8_t target_system = 1;               // Target drone id
@@ -225,8 +219,8 @@ void modemLoop(void) {
       return;
     }
 
-    uint8_t recvBuffer[sbdMessageSize];
-    size_t bufferSize = sbdMessageSize;
+    uint8_t recvBuffer[sbdMaxMessageSize];
+    size_t bufferSize = sbdMaxMessageSize;
 
     if (modemSendQueue.count() > 0) {
       char* data = nullptr;  // TODO: should be optimized using pointers
@@ -323,7 +317,7 @@ void receiveMAVLink(void) {
               mavlink_msg_global_position_int_decode(&msg, &global_position_int);
               Serial.println("Adding message to send queue");
               last_position_update_millis = millis();
-              char* data = new char[sbdMessageSize];
+              char* data = new char[sbdMaxMessageSize];
               sprintf(data, "lat: %d, long: %d, alt: %d, time: %d", global_position_int.lat, global_position_int.lon, global_position_int.alt, global_position_int.time_boot_ms);
               modemSendQueue.try_put(data);
             }
