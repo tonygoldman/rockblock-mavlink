@@ -397,6 +397,30 @@ void parseSystemTime(mavlink_message_t* msg) {
   droneStatus.time_unix_usec = systemTime.time_unix_usec;
 }
 
+void parseMavlinkMessage(mavlink_message_t* msg) {
+  switch (msg->msgid) {
+    case MAVLINK_MSG_ID_HEARTBEAT:
+      parseHeartbeat(msg);
+      break;
+
+    case MAVLINK_MSG_ID_GLOBAL_POSITION_INT:
+      parseGlobalPositionInt(msg);
+      break;
+
+    case MAVLINK_MSG_ID_ATTITUDE:
+      parseAttitude(msg);
+      break;
+
+    case MAVLINK_MSG_ID_SYS_STATUS:
+      parseSysStatus(msg);
+      break;
+
+    case MAVLINK_MSG_ID_SYSTEM_TIME:
+      parseSystemTime(msg);
+      break;
+  }
+}
+
 void receiveMAVLink(void) {
   int16_t lastReadChar;
   while (1) {
@@ -406,27 +430,7 @@ void receiveMAVLink(void) {
     mavlinkSerialMutex.lock();
     while ((lastReadChar = mavlinkSerial.read()) != -1) {
       if (mavlink_parse_char(MAVLINK_COMM_0, lastReadChar, &msg, &status)) {
-        switch (msg.msgid) {
-          case MAVLINK_MSG_ID_HEARTBEAT:
-            parseHeartbeat(&msg);
-            break;
-
-          case MAVLINK_MSG_ID_GLOBAL_POSITION_INT:
-            parseGlobalPositionInt(&msg);
-            break;
-
-          case MAVLINK_MSG_ID_ATTITUDE:
-            parseAttitude(&msg);
-            break;
-
-          case MAVLINK_MSG_ID_SYS_STATUS:
-            parseSysStatus(&msg);
-            break;
-
-          case MAVLINK_MSG_ID_SYSTEM_TIME:
-            parseSystemTime(&msg);
-            break;
-        }
+        parseMavlinkMessage(&msg);
       }
     }
     mavlinkSerialMutex.unlock();
