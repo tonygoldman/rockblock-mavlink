@@ -23,6 +23,9 @@
 #define RTL_EVENT (1UL << 1)
 #define STATUS_MSG_FORMAT ("{'signal':%d,'lat':%d,'lon':%d,'relative_alt':%d,'hdg':%u,'pitch':%d,'mode':%u,'voltage':%u,'time':%llu}")
 #define FLOAT_TO_INT_MULTIPLIER (100)
+#define RING_CLEARING_TIMEOUT_SEC (20)
+#define RING_CLEARING_CHECKING_INTERVAL_MILLIS (500)
+#define HEARTBEAT_TX_INTERVAL_MILLIS (1000)
 
 typedef struct __drone_status_t {
   // from global position int
@@ -58,10 +61,8 @@ rtos::Thread mavlinkRtlThread;
 rtos::Thread sendDroneStatusThread;
 rtos::Mutex mavlinkSerialMutex;
 rtos::EventFlags event_flags;
-char sbdSendQueue[SEND_QUEUE_MESSAGE_COUNT * SBD_MAX_MESSAGE_SIZE];
 drone_status_t droneStatus;
 enum sbdState sbd_state = sbdState::BOOTING;
-uint32_t counter = 0;
 
 bool ISBDCallback(void) {
   if ((millis() % 1000) == 0) {
@@ -234,7 +235,7 @@ void setupModem(void) {
   sbd_state = sbdState::IDLE;
 }
 
-// TODO: verify ack
+// TODO: verify ack?
 void sendRTL() {
   uint8_t target_system = 1;               // Target drone id
   uint8_t target_component = 0;            // Target component, 0 = all
@@ -261,8 +262,75 @@ void sendRTL() {
   mavlinkSerialMutex.unlock();
 }
 
+bool clearMobileOriginatedBuffer(void) {
+  // Clear the Mobile Originated message buffer - just in case it has an old message in it!
+  Serial.println(F("Clearing the MO buffer (just in case)."));
+  int err = sbdModem.clearBuffers(ISBD_CLEAR_MO);  // Clear MO buffer
+  if (err != ISBD_SUCCESS) {
+    Serial.print(F("clearBuffers failed: error "));
+    Serial.println(err);
+    return false;
+  }
+
+  return true;
+}
+
+
+bool sbdSendRecv(uint8_t* buffer, size_t* bufferSize, bool isSendEventSet) {
+  int err;
+  sbd_state = sbdState::SENDRECV;
+  if (isSendEventSet) {
+    char message[SBD_MAX_MESSAGE_SIZE];
+    droneStatusMessage(message);
+    Serial.print("Sending: ");
+    Serial.println(message);
+    sendStatusText("SBD: started sending");
+    err = sbdModem.sendReceiveSBDText(message, buffer, *bufferSize);
+    event_flags.clear(SBD_SEND_EVENT);
+
+  } else {
+    err = sbdModem.sendReceiveSBDText(NULL, buffer, *bufferSize);
+  }
+
+  if (err != ISBD_SUCCESS) {
+    Serial.print(F("sendReceiveSBDBinary failed: error "));
+    Serial.println(err);
+    sendStatusText("SBD: sending failed");
+    sbd_state = sbdState::ERROR;
+    return false;
+  }
+
+  sendStatusText("SBD: message sent");
+  sbd_state = sbdState::IDLE;
+  return true;
+}
+
+void processSendRecvOutput(uint8_t* buffer, size_t bufferSize) {
+  if (bufferSize > 0) {
+    Serial.print(F("Message received: "));
+    for (int i = 0; i < (int)bufferSize; ++i) {
+      if (isprint(buffer[i])) {
+        Serial.write(buffer[i]);
+      }
+    }
+    Serial.println();
+    Serial.print(F("Inbound message size is "));
+    Serial.println(bufferSize);
+
+    Serial.println("Setting RTL flag");
+    event_flags.set(RTL_EVENT);
+  }
+}
+
+void waitUntilRingCleared(void) {
+  int ring_clearing_iteration_timeout = RING_CLEARING_TIMEOUT_SEC * SECOND_TO_MILLIS / RING_CLEARING_CHECKING_INTERVAL_MILLIS;
+  for (uint8_t counter = 0; counter < ring_clearing_iteration_timeout && sbdModem.hasRingAsserted(); ++counter) {
+    Serial.printf("RING is still asserted. Waiting for it to clear: %u/%u\n", counter, ring_clearing_iteration_timeout);
+    rtos::ThisThread::sleep_for(RING_CLEARING_CHECKING_INTERVAL_MILLIS);
+  }
+}
+
 void modemLoop(void) {
-  static int err = ISBD_SUCCESS;
   bool ring = sbdModem.hasRingAsserted();
   int waitingMessageCount = sbdModem.getWaitingMessageCount();
   bool isSendEventSet = event_flags.get() & SBD_SEND_EVENT;
@@ -272,64 +340,13 @@ void modemLoop(void) {
   }
 
   if ((ring) || (waitingMessageCount > 0) || (isSendEventSet)) {
-    // Clear the Mobile Originated message buffer - just in case it has an old message in it!
-    Serial.println(F("Clearing the MO buffer (just in case)."));
-    err = sbdModem.clearBuffers(ISBD_CLEAR_MO);  // Clear MO buffer
-    if (err != ISBD_SUCCESS) {
-      Serial.print(F("clearBuffers failed: error "));
-      Serial.println(err);
-      return;
-    }
-
     uint8_t recvBuffer[SBD_MAX_MESSAGE_SIZE];
     size_t bufferSize = SBD_MAX_MESSAGE_SIZE;
 
-    sbd_state = sbdState::SENDRECV;
-    if (isSendEventSet) {
-      char message[SBD_MAX_MESSAGE_SIZE];
-      droneStatusMessage(message);
-      Serial.print("Sending: ");
-      Serial.println(message);
-      err = sbdModem.sendReceiveSBDText(message, recvBuffer, bufferSize);
-      event_flags.clear(SBD_SEND_EVENT);
-    } else {
-      err = sbdModem.sendReceiveSBDText(NULL, recvBuffer, bufferSize);
-    }
-
-
-    if (err != ISBD_SUCCESS) {
-      Serial.print(F("sendReceiveSBDBinary failed: error "));
-      Serial.println(err);
-      sbd_state = sbdState::ERROR;
-      return;
-    } else {
-      sbd_state = sbdState::IDLE;
-    }
-
-    if (bufferSize > 0) {
-      Serial.println("Setting RTL flag");
-      event_flags.set(RTL_EVENT);
-    }
-
-    if (bufferSize > 0) {
-      Serial.print(F("Message received: "));
-      for (int i = 0; i < (int)bufferSize; ++i) {
-        if (isprint(recvBuffer[i])) {
-          Serial.write(recvBuffer[i]);
-        }
-      }
-      Serial.println();
-      Serial.print(F("Inbound message size is "));
-      Serial.println(bufferSize);
-    }
-
-    while (ring == true) {
-      Serial.println(F("RING is still asserted. Waiting for it to clear..."));
-      rtos::ThisThread::sleep_for(500);
-      ring = sbdModem.hasRingAsserted();
-    }
-
-    Serial.println(F("RING has cleared. Begin waiting for a new RING..."));
+    if (!clearMobileOriginatedBuffer()) return;
+    if (!sbdSendRecv(recvBuffer, &bufferSize, isSendEventSet)) return;
+    processSendRecvOutput(recvBuffer, bufferSize);
+    waitUntilRingCleared();
   }
 
   rtos::ThisThread::sleep_for(1000);
@@ -348,8 +365,20 @@ void sendHeartbeat(void) {
     // Serial.println("Sending heartbeat");
     mavlinkSerial.write(buf, len);
     mavlinkSerialMutex.unlock();
-    rtos::ThisThread::sleep_for(1000);
+    rtos::ThisThread::sleep_for(HEARTBEAT_TX_INTERVAL_MILLIS);
   }
+}
+
+void sendStatusText(char* message) {
+  mavlink_message_t msg;
+  uint8_t buf[MAVLINK_MAX_PACKET_LEN];
+
+  mavlink_msg_statustext_pack(44, MAV_COMP_ID_ONBOARD_COMPUTER, &msg, MAV_SEVERITY_INFO, message, 0, 0);
+  uint16_t len = mavlink_msg_to_send_buffer(buf, &msg);
+
+  mavlinkSerialMutex.lock();
+  mavlinkSerial.write(buf, len);
+  mavlinkSerialMutex.unlock();
 }
 
 void parseHeartbeat(mavlink_message_t* msg) {
@@ -461,7 +490,6 @@ void setup(void) {
   sendDroneStatusThread.start(setSbdSendFlag);
   Serial.println("Threads started successfully");
   setupModem();
-  Serial.println("Setup completed, starting loop");
 }
 
 void loop(void) {
