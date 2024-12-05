@@ -21,7 +21,8 @@
 #define DRONE_STATUS_TRANSMISSION_INTERVAL_SEC (90)
 #define SBD_SEND_EVENT (1UL << 0)
 #define RTL_EVENT (1UL << 1)
-#define STATUS_MSG_FORMAT ("{'signal':%d,'lat':%d,'lon':%d,'relative_alt':%d,'hdg':%u,'pitch':%s,'mode':%u,'voltage':%u,'time':%llu}")
+#define STATUS_MSG_FORMAT ("{'signal':%d,'lat':%d,'lon':%d,'relative_alt':%d,'hdg':%u,'pitch':%d,'mode':%u,'voltage':%u,'time':%llu}")
+#define FLOAT_TO_INT_MULTIPLIER (100)
 
 typedef struct __drone_status_t {
   // from global position int
@@ -30,9 +31,9 @@ typedef struct __drone_status_t {
   int32_t relative_alt = 0; /*< [mm] Altitude above home*/
   uint16_t hdg = 0;         /*< [cdeg] Vehicle heading (yaw angle), 0.0..359.99 degrees. If unknown, set to: UINT16_MAX*/
   // from attitude
-  float roll = 0;  /*< [rad] Roll angle (-pi..+pi)*/
-  float pitch = 0; /*< [rad] Pitch angle (-pi..+pi)*/
-  float yaw = 0;   /*< [rad] Yaw angle (-pi..+pi)*/
+  int32_t roll = 0;  /*< Roll angle deg * FLOAT_TO_INT_MULTIPLIER*/
+  int32_t pitch = 0; /*< Pitch angle deg * FLOAT_TO_INT_MULTIPLIER*/
+  int32_t yaw = 0;   /*< Yaw angle deg * FLOAT_TO_INT_MULTIPLIER*/
   // from heartbeat
   uint32_t custom_mode = 0; /*<  A bitfield for use for autopilot-specific flags*/
   // from sys status
@@ -72,11 +73,8 @@ bool ISBDCallback(void) {
 void droneStatusMessage(char* message) {
   int signalQuality = -1;
   sbdModem.getSignalQuality(signalQuality);
-  
+
   // sprintf does not format floats due to a bug in mbedos github.com/sparkfun/Arduino_Apollo3/issues/278
-  char pitchStr[8];
-  ftoa(droneStatus.pitch,pitchStr,3,8);
-  
   snprintf(
     message,
     SBD_MAX_MESSAGE_SIZE,
@@ -86,7 +84,7 @@ void droneStatusMessage(char* message) {
     droneStatus.lon,
     droneStatus.relative_alt,
     droneStatus.hdg,
-    pitchStr,
+    droneStatus.pitch,
     droneStatus.custom_mode,
     droneStatus.voltage_battery,
     droneStatus.time_unix_usec);
@@ -371,13 +369,18 @@ void parseGlobalPositionInt(mavlink_message_t* msg) {
   droneStatus.relative_alt = globalPositionInt.relative_alt;
 }
 
+int32_t radiansToDegrees(float radians) {
+  float degrees = radians * (180.0 / M_PI);
+  return static_cast<int32_t>(degrees * FLOAT_TO_INT_MULTIPLIER);
+}
+
 void parseAttitude(mavlink_message_t* msg) {
   Serial.println("Parsing attitude");
   mavlink_attitude_t attitude;
   mavlink_msg_attitude_decode(msg, &attitude);
-  droneStatus.roll = attitude.roll;
-  droneStatus.pitch = attitude.pitch;
-  droneStatus.yaw = attitude.yaw;
+  droneStatus.roll = radiansToDegrees(attitude.roll);
+  droneStatus.pitch = radiansToDegrees(attitude.pitch);
+  droneStatus.yaw = radiansToDegrees(attitude.yaw);
 }
 
 void parseSysStatus(mavlink_message_t* msg) {
@@ -460,290 +463,3 @@ void setup(void) {
 void loop(void) {
   modemLoop();
 }
-
-// sprintf does not format floats due to a bug in mbedos github.com/sparkfun/Arduino_Apollo3/issues/278
-// This code is taken from github.com/sparkfun/SparkFun_Artemis_Global_Tracker/blob/main/Software/examples/Example15_BetterTracker/Example15_BetterTracker.ino
-
-//*****************************************************************************
-//
-//  Divide an unsigned 32-bit value by 10.
-//
-//  Note: Adapted from Ch10 of Hackers Delight (hackersdelight.org).
-//
-//*****************************************************************************
-static uint64_t divu64_10(uint64_t ui64Val)
-{
-    uint64_t q64, r64;
-    uint32_t q32, r32, ui32Val;
-
-    //
-    // If a 32-bit value, use the more optimal 32-bit routine.
-    //
-    if ( ui64Val >> 32 )
-    {
-        q64 = (ui64Val>>1) + (ui64Val>>2);
-        q64 += (q64 >> 4);
-        q64 += (q64 >> 8);
-        q64 += (q64 >> 16);
-        q64 += (q64 >> 32);
-        q64 >>= 3;
-        r64 = ui64Val - q64*10;
-        return q64 + ((r64 + 6) >> 4);
-    }
-    else
-    {
-        ui32Val = (uint32_t)(ui64Val & 0xffffffff);
-        q32 = (ui32Val>>1) + (ui32Val>>2);
-        q32 += (q32 >> 4);
-        q32 += (q32 >> 8);
-        q32 += (q32 >> 16);
-        q32 >>= 3;
-        r32 = ui32Val - q32*10;
-        return (uint64_t)(q32 + ((r32 + 6) >> 4));
-    }
-}
-
-//*****************************************************************************
-//
-// Converts ui64Val to a string.
-// Note: pcBuf[] must be sized for a minimum of 21 characters.
-//
-// Returns the number of decimal digits in the string.
-//
-// NOTE: If pcBuf is NULL, will compute a return ui64Val only (no chars
-// written).
-//
-//*****************************************************************************
-static int uint64_to_str(uint64_t ui64Val, char *pcBuf)
-{
-    char tbuf[25];
-    int ix = 0, iNumDig = 0;
-    unsigned uMod;
-    uint64_t u64Tmp;
-
-    do
-    {
-        //
-        // Divide by 10
-        //
-        u64Tmp = divu64_10(ui64Val);
-
-        //
-        // Get modulus
-        //
-        uMod = ui64Val - (u64Tmp * 10);
-
-        tbuf[ix++] = uMod + '0';
-        ui64Val = u64Tmp;
-    } while ( ui64Val );
-
-    //
-    // Save the total number of digits
-    //
-    iNumDig = ix;
-
-    //
-    // Now, reverse the buffer when saving to the caller's buffer.
-    //
-    if ( pcBuf )
-    {
-        while ( ix-- )
-        {
-            *pcBuf++ = tbuf[ix];
-        }
-
-        //
-        // Terminate the caller's buffer
-        //
-        *pcBuf = 0x00;
-    }
-
-    return iNumDig;
-}
-
-//*****************************************************************************
-//
-//  Float to ASCII text. A basic implementation for providing support for
-//  single-precision %f.
-//
-//  param
-//      fValue     = Float value to be converted.
-//      pcBuf      = Buffer to place string AND input of buffer size.
-//      iPrecision = Desired number of decimal places.
-//      bufSize    = The size (in bytes) of the buffer.
-//                   The recommended size is at least 16 bytes.
-//
-//  This function performs a basic translation of a floating point single
-//  precision value to a string.
-//
-//  return Number of chars printed to the buffer.
-//
-//*****************************************************************************
-#define OLA_FTOA_ERR_VAL_TOO_SMALL   -1
-#define OLA_FTOA_ERR_VAL_TOO_LARGE   -2
-#define OLA_FTOA_ERR_BUFSIZE         -3
-
-typedef union
-{
-    int32_t I32;
-    float F;
-} ola_i32fl_t;
-
-static int ftoa(float fValue, char *pcBuf, int iPrecision, int bufSize)
-{
-    ola_i32fl_t unFloatValue;
-    int iExp2, iBufSize;
-    int32_t i32Significand, i32IntPart, i32FracPart;
-    char *pcBufInitial, *pcBuftmp;
-
-    iBufSize = bufSize; // *(uint32_t*)pcBuf;
-    if (iBufSize < 4)
-    {
-        return OLA_FTOA_ERR_BUFSIZE;
-    }
-
-    if (fValue == 0.0f)
-    {
-        // "0.0"
-        *(uint32_t*)pcBuf = 0x00 << 24 | ('0' << 16) | ('.' << 8) | ('0' << 0);
-        return 3;
-    }
-
-    pcBufInitial = pcBuf;
-
-    unFloatValue.F = fValue;
-
-    iExp2 = ((unFloatValue.I32 >> 23) & 0x000000FF) - 127;
-    i32Significand = (unFloatValue.I32 & 0x00FFFFFF) | 0x00800000;
-    i32FracPart = 0;
-    i32IntPart = 0;
-
-    if (iExp2 >= 31)
-    {
-        return OLA_FTOA_ERR_VAL_TOO_LARGE;
-    }
-    else if (iExp2 < -23)
-    {
-        return OLA_FTOA_ERR_VAL_TOO_SMALL;
-    }
-    else if (iExp2 >= 23)
-    {
-        i32IntPart = i32Significand << (iExp2 - 23);
-    }
-    else if (iExp2 >= 0)
-    {
-        i32IntPart = i32Significand >> (23 - iExp2);
-        i32FracPart = (i32Significand << (iExp2 + 1)) & 0x00FFFFFF;
-    }
-    else // if (iExp2 < 0)
-    {
-        i32FracPart = (i32Significand & 0x00FFFFFF) >> -(iExp2 + 1);
-    }
-
-    if (unFloatValue.I32 < 0)
-    {
-        *pcBuf++ = '-';
-    }
-
-    if (i32IntPart == 0)
-    {
-        *pcBuf++ = '0';
-    }
-    else
-    {
-        if (i32IntPart > 0)
-        {
-            uint64_to_str(i32IntPart, pcBuf);
-        }
-        else
-        {
-            *pcBuf++ = '-';
-            uint64_to_str(-i32IntPart, pcBuf);
-        }
-        while (*pcBuf)    // Get to end of new string
-        {
-            pcBuf++;
-        }
-    }
-
-    //
-    // Now, begin the fractional part
-    //
-    *pcBuf++ = '.';
-
-    if (i32FracPart == 0)
-    {
-        *pcBuf++ = '0';
-    }
-    else
-    {
-        int jx, iMax;
-
-        iMax = iBufSize - (pcBuf - pcBufInitial) - 1;
-        iMax = (iMax > iPrecision) ? iPrecision : iMax;
-
-        for (jx = 0; jx < iMax; jx++)
-        {
-            i32FracPart *= 10;
-            *pcBuf++ = (i32FracPart >> 24) + '0';
-            i32FracPart &= 0x00FFFFFF;
-        }
-
-        //
-        // Per the printf spec, the number of digits printed to the right of the
-        // decimal point (i.e. iPrecision) should be rounded.
-        // Some examples:
-        // Value        iPrecision          Formatted value
-        // 1.36399      Unspecified (6)     1.363990
-        // 1.36399      3                   1.364
-        // 1.36399      4                   1.3640
-        // 1.36399      5                   1.36399
-        // 1.363994     Unspecified (6)     1.363994
-        // 1.363994     3                   1.364
-        // 1.363994     4                   1.3640
-        // 1.363994     5                   1.36399
-        // 1.363995     Unspecified (6)     1.363995
-        // 1.363995     3                   1.364
-        // 1.363995     4                   1.3640
-        // 1.363995     5                   1.36400
-        // 1.996        Unspecified (6)     1.996000
-        // 1.996        2                   2.00
-        // 1.996        3                   1.996
-        // 1.996        4                   1.9960
-        //
-        // To determine whether to round up, we'll look at what the next
-        // decimal value would have been.
-        //
-        if ( ((i32FracPart * 10) >> 24) >= 5 )
-        {
-            //
-            // Yes, we need to round up.
-            // Go back through the string and make adjustments as necessary.
-            //
-            pcBuftmp = pcBuf - 1;
-            while ( pcBuftmp >= pcBufInitial )
-            {
-                if ( *pcBuftmp == '.' )
-                {
-                }
-                else if ( *pcBuftmp == '9' )
-                {
-                    *pcBuftmp = '0';
-                }
-                else
-                {
-                    *pcBuftmp += 1;
-                    break;
-                }
-                pcBuftmp--;
-            }
-        }
-    }
-
-    //
-    // Terminate the string and we're done
-    //
-    *pcBuf = 0x00;
-
-    return (pcBuf - pcBufInitial);
-} // ftoa()
