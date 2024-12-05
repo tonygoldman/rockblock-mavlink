@@ -260,6 +260,7 @@ void sendRTL() {
   mavlinkSerialMutex.lock();
   mavlinkSerial.write(buf, len);
   mavlinkSerialMutex.unlock();
+  sendStatusText("SBD: set mode to rtl");
 }
 
 bool clearMobileOriginatedBuffer(void) {
